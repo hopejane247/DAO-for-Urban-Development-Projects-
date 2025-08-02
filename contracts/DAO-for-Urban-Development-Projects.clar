@@ -36,6 +36,7 @@
 
 (define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 500)) (amount uint))
     (let ((proposal-id (+ (var-get proposal-count) u1)))
+        (try! (check-dao-active))
         (asserts! (>= amount MIN-PROPOSAL-AMOUNT) ERR-INVALID-AMOUNT)
         (map-set proposals proposal-id
             {
@@ -123,6 +124,7 @@
         (current-votes (default-to {yes-votes: u0, no-votes: u0, total-voters: u0} 
                                   (map-get? proposal-votes proposal-id)))
     )
+        (try! (check-dao-active))
         (asserts! (not (default-to false (map-get? votes {proposal-id: proposal-id, voter: tx-sender}))) ERR-ALREADY-VOTED)
         (asserts! (< burn-block-height (get deadline proposal)) ERR-PROPOSAL-EXPIRED)
         (asserts! (> voter-stake u0) ERR-NOT-AUTHORIZED)
@@ -394,3 +396,106 @@
             total-milestones: total-milestones,
             completed-milestones: (count-completed-milestones proposal-id)
         })))
+
+(define-constant ERR-DAO-PAUSED (err u109))
+(define-constant ERR-EMERGENCY-TIMEOUT (err u110))
+(define-constant ERR-INSUFFICIENT-EMERGENCY-VOTES (err u111))
+(define-constant EMERGENCY-PAUSE-DURATION u2016)
+(define-constant EMERGENCY-VOTE_THRESHOLD u75)
+
+(define-data-var dao-paused bool false)
+(define-data-var pause-expiry uint u0)
+(define-data-var emergency-proposal-count uint u0)
+
+(define-map emergency-proposals
+    uint
+    {
+        creator: principal,
+        action: (string-ascii 20),
+        reason: (string-ascii 300),
+        votes: uint,
+        executed: bool,
+        deadline: uint
+    }
+)
+
+(define-map emergency-votes {proposal-id: uint, voter: principal} bool)
+
+(define-private (check-dao-active)
+    (if (var-get dao-paused)
+        (if (<= burn-block-height (var-get pause-expiry))
+            ERR-DAO-PAUSED
+            (begin
+                (var-set dao-paused false)
+                (var-set pause-expiry u0)
+                (ok true)))
+        (ok true)))
+
+(define-public (create-emergency-proposal (action (string-ascii 20)) (reason (string-ascii 300)))
+    (let ((emergency-id (+ (var-get emergency-proposal-count) u1)))
+        (asserts! (or (is-eq action "pause") (is-eq action "unpause")) ERR-INVALID-AMOUNT)
+        (asserts! (> (default-to u0 (map-get? member-stakes tx-sender)) u0) ERR-NOT-AUTHORIZED)
+        
+        (map-set emergency-proposals emergency-id
+            {
+                creator: tx-sender,
+                action: action,
+                reason: reason,
+                votes: u0,
+                executed: false,
+                deadline: (+ burn-block-height u144)
+            }
+        )
+        (var-set emergency-proposal-count emergency-id)
+        (ok emergency-id)))
+
+(define-public (vote-emergency-proposal (emergency-id uint))
+    (let (
+        (emergency (unwrap! (map-get? emergency-proposals emergency-id) ERR-PROPOSAL-NOT-FOUND))
+        (voter-stake (default-to u0 (map-get? member-stakes tx-sender)))
+        (voting-power (* voter-stake VOTING_POWER_MULTIPLIER))
+    )
+        (asserts! (not (default-to false (map-get? emergency-votes {proposal-id: emergency-id, voter: tx-sender}))) ERR-ALREADY-VOTED)
+        (asserts! (< burn-block-height (get deadline emergency)) ERR-PROPOSAL-EXPIRED)
+        (asserts! (not (get executed emergency)) ERR-PROPOSAL-NOT-FOUND)
+        (asserts! (> voter-stake u0) ERR-NOT-AUTHORIZED)
+        
+        (map-set emergency-proposals emergency-id
+            (merge emergency {votes: (+ (get votes emergency) voting-power)})
+        )
+        (map-set emergency-votes {proposal-id: emergency-id, voter: tx-sender} true)
+        (ok true)))
+
+(define-public (execute-emergency-proposal (emergency-id uint))
+    (let (
+        (emergency (unwrap! (map-get? emergency-proposals emergency-id) ERR-PROPOSAL-NOT-FOUND))
+        (total-possible-votes (* (var-get total-staked-tokens) VOTING_POWER_MULTIPLIER))
+        (vote-percentage (if (> total-possible-votes u0) (/ (* (get votes emergency) u100) total-possible-votes) u0))
+    )
+        (asserts! (not (get executed emergency)) ERR-PROPOSAL-NOT-FOUND)
+        (asserts! (>= burn-block-height (get deadline emergency)) ERR-PROPOSAL-EXPIRED)
+        (asserts! (>= vote-percentage EMERGENCY-VOTE_THRESHOLD) ERR-INSUFFICIENT-EMERGENCY-VOTES)
+        
+        (if (is-eq (get action emergency) "pause")
+            (begin
+                (var-set dao-paused true)
+                (var-set pause-expiry (+ burn-block-height EMERGENCY-PAUSE-DURATION))
+                (map-set emergency-proposals emergency-id (merge emergency {executed: true}))
+                (ok true))
+            (if (is-eq (get action emergency) "unpause")
+                (begin
+                    (var-set dao-paused false)
+                    (var-set pause-expiry u0)
+                    (map-set emergency-proposals emergency-id (merge emergency {executed: true}))
+                    (ok true))
+                ERR-INVALID-AMOUNT))))
+
+(define-read-only (get-emergency-status)
+    (ok {
+        is-paused: (var-get dao-paused),
+        pause-expiry: (var-get pause-expiry),
+        blocks-remaining: (if (var-get dao-paused) (- (var-get pause-expiry) burn-block-height) u0)
+    }))
+
+(define-read-only (get-emergency-proposal (emergency-id uint))
+    (ok (map-get? emergency-proposals emergency-id)))
