@@ -499,3 +499,231 @@
 
 (define-read-only (get-emergency-proposal (emergency-id uint))
     (ok (map-get? emergency-proposals emergency-id)))
+
+(define-constant ERR-INSUFFICIENT-REPUTATION (err u112))
+(define-constant MIN-REPUTATION-FOR-PROPOSAL u50)
+(define-constant REPUTATION-VOTE-BONUS u5)
+(define-constant REPUTATION-PROPOSAL_SUCCESS_BONUS u20)
+(define-constant REPUTATION-PROPOSAL_FAILURE_PENALTY u10)
+(define-constant MAX-REPUTATION u1000)
+(define-constant INITIAL-REPUTATION u100)
+
+(define-data-var reputation-updates-count uint u0)
+
+(define-map member-reputation principal {
+    score: uint,
+    proposals-created: uint,
+    successful-proposals: uint,
+    votes-cast: uint,
+    correct-votes: uint,
+    last-activity: uint
+})
+
+(define-map proposal-outcome-tracking uint {
+    final-status: (string-ascii 20),
+    supporters: (list 50 principal),
+    opposers: (list 50 principal)
+})
+
+(define-public (initialize-member-reputation)
+    (let ((current-rep (map-get? member-reputation tx-sender)))
+        (if (is-none current-rep)
+            (begin
+                (map-set member-reputation tx-sender {
+                    score: INITIAL-REPUTATION,
+                    proposals-created: u0,
+                    successful-proposals: u0,
+                    votes-cast: u0,
+                    correct-votes: u0,
+                    last-activity: burn-block-height
+                })
+                (ok true))
+            (ok true))))
+
+(define-private (min-value (a uint) (b uint))
+    (if (< a b) a b))
+
+(define-public (update-reputation-for-vote (member principal) (proposal-id uint) (vote-type bool))
+    (let (
+        (current-rep (default-to {
+            score: INITIAL-REPUTATION,
+            proposals-created: u0,
+            successful-proposals: u0,
+            votes-cast: u0,
+            correct-votes: u0,
+            last-activity: u0
+        } (map-get? member-reputation member)))
+    )
+        (map-set member-reputation member {
+            score: (min-value (+ (get score current-rep) REPUTATION-VOTE-BONUS) MAX-REPUTATION),
+            proposals-created: (get proposals-created current-rep),
+            successful-proposals: (get successful-proposals current-rep),
+            votes-cast: (+ (get votes-cast current-rep) u1),
+            correct-votes: (get correct-votes current-rep),
+            last-activity: burn-block-height
+        })
+        (ok true)))
+
+(define-public (create-proposal-with-reputation (title (string-ascii 50)) (description (string-ascii 500)) (amount uint))
+    (let (
+        (member-rep (default-to {
+            score: INITIAL-REPUTATION,
+            proposals-created: u0,
+            successful-proposals: u0,
+            votes-cast: u0,
+            correct-votes: u0,
+            last-activity: u0
+        } (map-get? member-reputation tx-sender)))
+        (proposal-id (+ (var-get proposal-count) u1))
+    )
+        (try! (check-dao-active))
+        (asserts! (>= (get score member-rep) MIN-REPUTATION-FOR-PROPOSAL) ERR-INSUFFICIENT-REPUTATION)
+        (asserts! (>= amount MIN-PROPOSAL-AMOUNT) ERR-INVALID-AMOUNT)
+        
+        (map-set proposals proposal-id {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            amount: amount,
+            votes: u0,
+            status: "active",
+            deadline: (+ burn-block-height PROPOSAL-DURATION),
+            executed: false
+        })
+        
+        (map-set member-reputation tx-sender {
+            score: (get score member-rep),
+            proposals-created: (+ (get proposals-created member-rep) u1),
+            successful-proposals: (get successful-proposals member-rep),
+            votes-cast: (get votes-cast member-rep),
+            correct-votes: (get correct-votes member-rep),
+            last-activity: burn-block-height
+        })
+        
+        (var-set proposal-count proposal-id)
+        (ok proposal-id)))
+
+(define-public (finalize-proposal-outcome (proposal-id uint) (success bool))
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+        (creator (get creator proposal))
+        (creator-rep (default-to {
+            score: INITIAL-REPUTATION,
+            proposals-created: u0,
+            successful-proposals: u0,
+            votes-cast: u0,
+            correct-votes: u0,
+            last-activity: u0
+        } (map-get? member-reputation creator)))
+    )
+        (asserts! (or (is-eq (get status proposal) "executed") 
+                     (>= burn-block-height (get deadline proposal))) ERR-PROPOSAL-NOT-FOUND)
+        
+        (if success
+            (map-set member-reputation creator {
+                score: (min-value (+ (get score creator-rep) REPUTATION-PROPOSAL_SUCCESS_BONUS) MAX-REPUTATION),
+                proposals-created: (get proposals-created creator-rep),
+                successful-proposals: (+ (get successful-proposals creator-rep) u1),
+                votes-cast: (get votes-cast creator-rep),
+                correct-votes: (get correct-votes creator-rep),
+                last-activity: burn-block-height
+            })
+            (map-set member-reputation creator {
+                score: (if (> (get score creator-rep) REPUTATION-PROPOSAL_FAILURE_PENALTY)
+                          (- (get score creator-rep) REPUTATION-PROPOSAL_FAILURE_PENALTY)
+                          u0),
+                proposals-created: (get proposals-created creator-rep),
+                successful-proposals: (get successful-proposals creator-rep),
+                votes-cast: (get votes-cast creator-rep),
+                correct-votes: (get correct-votes creator-rep),
+                last-activity: burn-block-height
+            }))
+        
+        (map-set proposal-outcome-tracking proposal-id {
+            final-status: (if success "successful" "failed"),
+            supporters: (list),
+            opposers: (list)
+        })
+        
+        (ok true)))
+
+(define-public (get-weighted-voting-power (member principal))
+    (let (
+        (base-stake (default-to u0 (map-get? member-stakes member)))
+        (reputation-data (map-get? member-reputation member))
+    )
+        (match reputation-data
+            some-rep (let (
+                (reputation-multiplier (/ (get score some-rep) u10))
+                (base-power (* base-stake VOTING_POWER_MULTIPLIER))
+            )
+                (ok (+ base-power reputation-multiplier)))
+            (ok (* base-stake VOTING_POWER_MULTIPLIER)))))
+
+(define-public (vote-with-reputation (proposal-id uint) (vote-yes bool))
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+        (voting-power-result (unwrap! (get-weighted-voting-power tx-sender) ERR-NOT-AUTHORIZED))
+        (current-votes (default-to {yes-votes: u0, no-votes: u0, total-voters: u0} 
+                                  (map-get? proposal-votes proposal-id)))
+    )
+        (try! (check-dao-active))
+        (unwrap! (initialize-member-reputation) ERR-NOT-AUTHORIZED)
+        (asserts! (not (default-to false (map-get? votes {proposal-id: proposal-id, voter: tx-sender}))) ERR-ALREADY-VOTED)
+        (asserts! (< burn-block-height (get deadline proposal)) ERR-PROPOSAL-EXPIRED)
+        (asserts! (> (default-to u0 (map-get? member-stakes tx-sender)) u0) ERR-NOT-AUTHORIZED)
+        
+        (if vote-yes
+            (map-set proposal-votes proposal-id {
+                yes-votes: (+ (get yes-votes current-votes) voting-power-result),
+                no-votes: (get no-votes current-votes),
+                total-voters: (+ (get total-voters current-votes) u1)
+            })
+            (map-set proposal-votes proposal-id {
+                yes-votes: (get yes-votes current-votes),
+                no-votes: (+ (get no-votes current-votes) voting-power-result),
+                total-voters: (+ (get total-voters current-votes) u1)
+            }))
+        
+        (map-set votes {proposal-id: proposal-id, voter: tx-sender} true)
+        (unwrap! (update-reputation-for-vote tx-sender proposal-id vote-yes) ERR-NOT-AUTHORIZED)
+        (ok true)))
+
+(define-read-only (get-member-reputation (member principal))
+    (ok (map-get? member-reputation member)))
+
+(define-read-only (calculate-member-governance-score (member principal))
+    (let (
+        (rep-data (map-get? member-reputation member))
+        (stake (default-to u0 (map-get? member-stakes member)))
+    )
+        (match rep-data
+            some-rep (let (
+                (participation-rate (if (> (get votes-cast some-rep) u0)
+                                      (/ (* (get correct-votes some-rep) u100) (get votes-cast some-rep))
+                                      u0))
+                (proposal-success-rate (if (> (get proposals-created some-rep) u0)
+                                         (/ (* (get successful-proposals some-rep) u100) (get proposals-created some-rep))
+                                         u0))
+                (activity-score (get score some-rep))
+                (governance-score (/ (+ participation-rate proposal-success-rate activity-score) u3))
+            )
+                (ok {
+                    reputation-score: activity-score,
+                    participation-rate: participation-rate,
+                    proposal-success-rate: proposal-success-rate,
+                    governance-score: governance-score,
+                    stake-amount: stake,
+                    total-influence: (+ governance-score (/ stake u1000))
+                }))
+            (ok {
+                reputation-score: u0,
+                participation-rate: u0,
+                proposal-success-rate: u0,
+                governance-score: u0,
+                stake-amount: stake,
+                total-influence: (/ stake u1000)
+            }))))
+
+(define-read-only (get-top-contributors)
+    (ok "Feature available - implement ranking algorithm based on governance scores"))
