@@ -727,3 +727,146 @@
 
 (define-read-only (get-top-contributors)
     (ok "Feature available - implement ranking algorithm based on governance scores"))
+
+;; PROPOSAL DEPOSIT ESCROW SYSTEM
+;; Constants for deposit system
+(define-constant ERR-DEPOSIT-NOT-FOUND (err u113))
+(define-constant ERR-DEPOSIT-ALREADY-PROCESSED (err u114))
+(define-constant PROPOSAL-DEPOSIT-AMOUNT u500000) ;; 0.5 STX deposit required
+
+;; Map to track proposal deposits
+(define-map proposal-deposits
+    uint ;; proposal-id
+    {
+        proposer: principal,
+        deposit-amount: uint,
+        refunded: bool,
+        forfeited: bool,
+        processed-at: (optional uint)
+    }
+)
+
+;; Public function: Create proposal with deposit escrow
+(define-public (create-proposal-with-deposit 
+    (title (string-ascii 50)) 
+    (description (string-ascii 500)) 
+    (amount uint)
+)
+    (let (
+        (proposal-id (+ (var-get proposal-count) u1))
+        (member-rep (default-to {
+            score: INITIAL-REPUTATION,
+            proposals-created: u0,
+            successful-proposals: u0,
+            votes-cast: u0,
+            correct-votes: u0,
+            last-activity: u0
+        } (map-get? member-reputation tx-sender)))
+    )
+        (try! (check-dao-active))
+        (asserts! (>= (get score member-rep) MIN-REPUTATION-FOR-PROPOSAL) ERR-INSUFFICIENT-REPUTATION)
+        (asserts! (>= amount MIN-PROPOSAL-AMOUNT) ERR-INVALID-AMOUNT)
+        
+        ;; Transfer deposit to contract escrow
+        (try! (stx-transfer? PROPOSAL-DEPOSIT-AMOUNT tx-sender (as-contract tx-sender)))
+        
+        ;; Create the proposal
+        (map-set proposals proposal-id {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            amount: amount,
+            votes: u0,
+            status: "active",
+            deadline: (+ burn-block-height PROPOSAL-DURATION),
+            executed: false
+        })
+        
+        ;; Store deposit information
+        (map-set proposal-deposits proposal-id {
+            proposer: tx-sender,
+            deposit-amount: PROPOSAL-DEPOSIT-AMOUNT,
+            refunded: false,
+            forfeited: false,
+            processed-at: none
+        })
+        
+        ;; Update reputation tracking
+        (map-set member-reputation tx-sender {
+            score: (get score member-rep),
+            proposals-created: (+ (get proposals-created member-rep) u1),
+            successful-proposals: (get successful-proposals member-rep),
+            votes-cast: (get votes-cast member-rep),
+            correct-votes: (get correct-votes member-rep),
+            last-activity: burn-block-height
+        })
+        
+        (var-set proposal-count proposal-id)
+        (ok proposal-id)
+    )
+)
+
+;; Public function: Process proposal deposit after voting period
+(define-public (finalize-proposal-with-deposit (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+        (deposit (unwrap! (map-get? proposal-deposits proposal-id) ERR-DEPOSIT-NOT-FOUND))
+        (vote-data (default-to {yes-votes: u0, no-votes: u0, total-voters: u0} 
+                               (map-get? proposal-votes proposal-id)))
+        (total-votes (+ (get yes-votes vote-data) (get no-votes vote-data)))
+        (total-possible-votes (* (var-get total-staked-tokens) VOTING_POWER_MULTIPLIER))
+    )
+        ;; Check that voting period has ended
+        (asserts! (>= burn-block-height (get deadline proposal)) ERR-PROPOSAL-EXPIRED)
+        ;; Check deposit hasn't been processed yet
+        (asserts! (not (get refunded deposit)) ERR-DEPOSIT-ALREADY-PROCESSED)
+        (asserts! (not (get forfeited deposit)) ERR-DEPOSIT-ALREADY-PROCESSED)
+        
+        (let (
+            (participation-rate (if (> total-possible-votes u0) 
+                                  (/ (* total-votes u100) total-possible-votes) 
+                                  u0))
+            (approval-rate (if (> total-votes u0) 
+                             (/ (* (get yes-votes vote-data) u100) total-votes) 
+                             u0))
+            (meets-quorum (>= participation-rate QUORUM-PERCENTAGE))
+            (meets-threshold (>= approval-rate APPROVAL-THRESHOLD))
+            (proposal-passed (and meets-quorum meets-threshold))
+        )
+            (if proposal-passed
+                ;; Proposal passed - refund deposit to proposer
+                (begin
+                    (try! (as-contract (stx-transfer? 
+                        (get deposit-amount deposit)
+                        tx-sender
+                        (get proposer deposit)
+                    )))
+                    (map-set proposal-deposits proposal-id
+                        (merge deposit {
+                            refunded: true,
+                            processed-at: (some burn-block-height)
+                        })
+                    )
+                    (ok "deposit-refunded")
+                )
+                ;; Proposal failed - forfeit deposit to DAO treasury
+                (begin
+                    (map-set proposal-deposits proposal-id
+                        (merge deposit {
+                            forfeited: true,
+                            processed-at: (some burn-block-height)
+                        })
+                    )
+                    ;; Deposit stays in contract (adds to DAO treasury)
+                    (var-set total-funds (+ (var-get total-funds) (get deposit-amount deposit)))
+                    (ok "deposit-forfeited")
+                )
+            )
+        )
+    )
+)
+
+;; Read-only function: Get proposal deposit information
+(define-read-only (get-proposal-deposit (proposal-id uint))
+    (ok (map-get? proposal-deposits proposal-id))
+)
